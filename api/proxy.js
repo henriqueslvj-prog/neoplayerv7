@@ -1,4 +1,4 @@
-const DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36 NeoPlayer/7.0';
+const DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36 NeoPlayer/8.0';
 
 function setCors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -49,10 +49,13 @@ function isManifest(contentType, target) {
 
 async function streamBodyToResponse(body, res) {
   if (!body) return res.end();
-  // Node/Vercel exposes fetch() response bodies as Web Streams. Convert and pipe
-  // instead of buffering the entire movie/episode/segment in memory.
-  const { Readable } = await import('node:stream');
-  Readable.fromWeb(body).pipe(res);
+  try {
+    for await (const chunk of body) {
+      if (!res.write(chunk)) await new Promise(resolve => res.once('drain', resolve));
+    }
+  } finally {
+    res.end();
+  }
 }
 
 export default async function handler(req, res) {
