@@ -15,7 +15,7 @@ function parseTarget(raw) {
   if (host === 'localhost' || host === '::1' || host === '0.0.0.0' || host.endsWith('.local') || host.endsWith('.internal')) {
     throw new Error('Destino não permitido.');
   }
-  const ip = host.match(/^(?:\\d{1,3}\\.){3}\\d{1,3}$/)?.[0];
+  const ip = host.match(/^(?:\d{1,3}\.){3}\d{1,3}$/)?.[0];
   if (ip) {
     const [a,b] = ip.split('.').map(Number);
     if (a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254)) {
