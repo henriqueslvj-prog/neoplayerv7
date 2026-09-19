@@ -25,20 +25,20 @@ function parseTarget(raw) {
   return target;
 }
 
-function proxyUrl(url) { return `/api/proxy?url=${encodeURIComponent(url)}`; }
+function proxyUrl(url, opts={}) { const q=new URLSearchParams({url}); if(opts.ua)q.set('ua',opts.ua); if(opts.ref)q.set('ref',opts.ref); return `/api/proxy?${q.toString()}`; }
 function looksLikeManifest(text, contentType='') { return /#EXTM3U/i.test(text.slice(0, 500)) || /mpegurl|m3u8/i.test(contentType); }
 
-function rewriteManifest(text, baseUrl) {
+function rewriteManifest(text, baseUrl, opts={}) {
   text = text.replace(/URI="([^"]+)"/gi, (_, ref) => {
     if (/^(data:|blob:|https?:\/\/.*\/api\/proxy\?url=)/i.test(ref)) return `URI="${ref}"`;
-    try { return `URI="${proxyUrl(new URL(ref, baseUrl).href)}"`; } catch { return `URI="${ref}"`; }
+    try { return `URI="${proxyUrl(new URL(ref, baseUrl).href, opts)}"`; } catch { return `URI="${ref}"`; }
   });
   return text.split(/\r?\n/).map(line => {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith('#')) return line;
     try {
       if (/^(data:|blob:)/i.test(trimmed)) return line;
-      return proxyUrl(new URL(trimmed, baseUrl).href);
+      return proxyUrl(new URL(trimmed, baseUrl).href, opts);
     } catch { return line; }
   }).join('\n');
 }
@@ -75,8 +75,11 @@ export default async function handler(req, res) {
   const timer = setTimeout(() => controller.abort(), 55000);
   try {
     const range = req.headers.range;
+    const customUA = typeof req.query?.ua === 'string' ? req.query.ua.slice(0, 500) : '';
+    const customRef = typeof req.query?.ref === 'string' ? req.query.ref.slice(0, 2000) : '';
     const headers = {
-      'User-Agent': DEFAULT_UA,
+      'User-Agent': customUA || DEFAULT_UA,
+      ...(customRef ? {'Referer': customRef} : {}),
       'Accept': 'application/x-mpegURL, application/vnd.apple.mpegurl, video/mp4, video/*, */*',
       'Accept-Encoding': 'identity'
     };
@@ -86,7 +89,7 @@ export default async function handler(req, res) {
     try {
       upstream = await fetch(target.href, {redirect:'follow', signal:controller.signal, headers, cache:'no-store'});
     } catch {
-      upstream = await fetch(target.href, {redirect:'follow', signal:controller.signal, headers:{'User-Agent':DEFAULT_UA,'Accept':'*/*','Accept-Encoding':'identity'}, cache:'no-store'});
+      upstream = await fetch(target.href, {redirect:'follow', signal:controller.signal, headers:{'User-Agent':customUA||DEFAULT_UA,...(customRef?{'Referer':customRef}:{}),'Accept':'*/*','Accept-Encoding':'identity'}, cache:'no-store'});
     }
 
     if (!upstream.ok && upstream.status !== 206) {
@@ -107,7 +110,7 @@ export default async function handler(req, res) {
     if (isManifest(contentType, target)) {
       const text = await upstream.text();
       if (!looksLikeManifest(text, contentType)) return res.status(502).json({error:'Resposta não parece ser um manifesto HLS válido.'});
-      const rewritten = rewriteManifest(text, finalUrl);
+      const rewritten = rewriteManifest(text, finalUrl, {ua:customUA,ref:customRef});
       res.statusCode = 200;
       res.setHeader('Content-Type','application/vnd.apple.mpegurl');
       res.setHeader('Cache-Control','no-store, no-cache, must-revalidate');
