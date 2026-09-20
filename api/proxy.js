@@ -99,6 +99,27 @@ export default async function handler(req, res) {
     const contentType = upstream.headers.get('content-type') || '';
     const finalUrl = upstream.url || target.href;
 
+    // Probe mode: the client needs to know which playback engine to use BEFORE
+    // handing the URL to hls.js. If it's raw MPEG-TS, hls.js would keep
+    // downloading an endless stream waiting for a manifest to finish — no error,
+    // no playback, just a growing request. Read only the first chunk and abort.
+    if (req.query?.probe) {
+      let kind = 'media';
+      try {
+        const reader = upstream.body.getReader();
+        const { value, done } = await reader.read();
+        const head = Buffer.from((value || new Uint8Array(0)).slice(0, 16)).toString('utf8').trimStart();
+        if (!done && /^#EXTM3U/i.test(head)) kind = 'hls';
+        else if (/mpegurl|m3u8/i.test(contentType)) kind = 'hls';
+        try { await reader.cancel(); } catch {}
+      } catch {
+        kind = /mpegurl|m3u8/i.test(contentType) ? 'hls' : 'media';
+      }
+      controller.abort();
+      res.setHeader('Cache-Control','no-store');
+      return res.status(200).json({ kind, contentType });
+    }
+
     if (req.query?.mode === 'playlist') {
       const content = await upstream.text();
       if (!content.trim()) return res.status(502).json({error:'Playlist vazia.'});
@@ -107,15 +128,59 @@ export default async function handler(req, res) {
       return res.status(200).json({content, finalUrl});
     }
 
+    // Many Xtream/IPTV panels answer a "live/.../ID.m3u8" URL with raw MPEG-TS
+    // bytes instead of an actual HLS manifest. Deciding by file extension alone
+    // (the old isManifest() check) meant every live channel got its binary
+    // stream read with upstream.text() — either hanging on an endless live
+    // stream or getting corrupted, and then rejected as "not a valid manifest".
+    // Instead, peek at the first chunk that actually arrives and branch on it.
     if (isManifest(contentType, target)) {
-      const text = await upstream.text();
-      if (!looksLikeManifest(text, contentType)) return res.status(502).json({error:'Resposta não parece ser um manifesto HLS válido.'});
-      const rewritten = rewriteManifest(text, finalUrl, {ua:customUA,ref:customRef});
-      res.statusCode = 200;
-      res.setHeader('Content-Type','application/vnd.apple.mpegurl');
-      res.setHeader('Cache-Control','no-store, no-cache, must-revalidate');
-      res.setHeader('Content-Length', Buffer.byteLength(rewritten));
-      return res.end(rewritten);
+      const reader = upstream.body.getReader();
+      const first = await reader.read();
+      const firstChunk = first.value || new Uint8Array(0);
+      const head = Buffer.from(firstChunk.slice(0, 16)).toString('utf8').trimStart();
+
+      if (!first.done && /^#EXTM3U/i.test(head)) {
+        // Real HLS manifest: accumulate the (small) text body and rewrite it.
+        let text = Buffer.from(firstChunk).toString('utf8');
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          text += Buffer.from(value).toString('utf8');
+          if (text.length > 4_000_000) break; // safety cap, manifests are tiny
+        }
+        if (!looksLikeManifest(text, contentType)) return res.status(502).json({error:'Resposta não parece ser um manifesto HLS válido.'});
+        const rewritten = rewriteManifest(text, finalUrl, {ua:customUA,ref:customRef});
+        res.statusCode = 200;
+        res.setHeader('Content-Type','application/vnd.apple.mpegurl');
+        res.setHeader('Cache-Control','no-store, no-cache, must-revalidate');
+        res.setHeader('Content-Length', Buffer.byteLength(rewritten));
+        return res.end(rewritten);
+      }
+
+      // Not actually a manifest — it's a raw media/TS stream mislabeled with a
+      // .m3u8 path. Pass it through as binary, starting with the bytes already
+      // read, instead of erroring out. This is what makes plain MPEG-TS live
+      // channels (very common on IPTV panels) work.
+      const status = upstream.status === 206 ? 206 : 200;
+      res.statusCode = status;
+      res.setHeader('Content-Type', contentType && !/mpegurl|m3u8/i.test(contentType) ? contentType : 'video/mp2t');
+      for (const h of ['content-length','content-range','accept-ranges','etag','last-modified']) {
+        const v = upstream.headers.get(h); if (v) res.setHeader(h, v);
+      }
+      res.setHeader('Cache-Control','no-store');
+      if (firstChunk.length && !res.write(Buffer.from(firstChunk))) await new Promise(resolve => res.once('drain', resolve));
+      if (first.done) return res.end();
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (!res.write(Buffer.from(value))) await new Promise(resolve => res.once('drain', resolve));
+        }
+      } finally {
+        res.end();
+      }
+      return;
     }
 
     // Critical: stream media instead of using arrayBuffer(). Large MP4/M4V/TS
