@@ -1,10 +1,345 @@
-import React from "react";
-import ReactDOM from "react-dom/client";
-import App from "./App";
-import "./styles.css";
+import React,{useCallback,useEffect,useMemo,useRef,useState} from 'react';
+import {createRoot} from 'react-dom/client';
+import Hls from 'hls.js';
+import mpegts from 'mpegts.js';
+import {Search,Home,Tv,Film,Layers3,Star,Clock3,Settings,Plus,Play,Pause,Volume2,VolumeX,Maximize,Minimize,X,ChevronRight,RotateCcw,RotateCw,Trash2,Link2,Upload,Menu,SlidersHorizontal,RefreshCw,Info,Eye,EyeOff,CheckCircle2,ChevronDown,Filter,Ratio,ArrowDownUp} from 'lucide-react';
+import './styles.css';
 
-ReactDOM.createRoot(document.getElementById("root")).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>
-);
+const DB_NAME='NeoPlayerDB',DB_VERSION=2,EMPTY={playlists:[],active:null,favorites:[],history:[]};
+
+// --- Título de exibição "limpo" + capa automática (usados por Card, Hero, SeriesBrowser) ---
+
+const DISPLAY_NOISE=/\b(4k|uhd|fhd|hd|sd|2160p|1080p|720p|480p|h\.?265|h\.?264|hevc|x264|x265|10bit|hdr10?|dual[\s._-]?audio|dublado|legendado|leg|dub|nacional|multi(?:\-audio)?|web[\s._-]?rip|webdl|bluray|brrip|remux)\b/gi;
+const DISPLAY_LINKS=/(?:https?:\/\/\S+|www\.\S+|t\.me\/\S+|wa\.me\/\S+|bit\.ly\/\S+|@[a-z0-9_]{3,32}\b)/gi;
+function displayTitle(name){
+  const raw=String(name||'');
+  let s=raw,year=null;
+  const ym=s.match(/\((19|20)\d{2}\)/);
+  if(ym){year=ym[0].replace(/[()]/g,'');s=s.replace(ym[0],'')}
+  s=s.replace(DISPLAY_LINKS,' ').replace(/\[[^\]]*\]/g,' ').replace(DISPLAY_NOISE,' ').replace(/[|_]+/g,' ').replace(/\s{2,}/g,' ').replace(/^[\s\-–.:]+|[\s\-–.:]+$/g,'').trim();
+  return {title:s||raw.trim(),year};
+}
+
+const artworkCache=new Map(); // `${type}:${title}` -> string url ('' = nada encontrado) | Promise
+function artworkKey(type,title){return `${type}:${title.toLowerCase()}`}
+function fetchArtwork(title,type){
+  const key=artworkKey(type,title);
+  if(artworkCache.has(key)){const c=artworkCache.get(key);return typeof c==='string'?Promise.resolve(c):c}
+  const p=fetch(`/api/artwork?title=${encodeURIComponent(title)}&type=${type}`)
+    .then(r=>r.ok?r.json():{poster:null}).then(d=>d.poster||'').catch(()=>'');
+  artworkCache.set(key,p);
+  p.then(v=>artworkCache.set(key,v));
+  return p;
+}
+/** Hook: resolve uma capa automática (sob demanda, só quando `el` entra na tela) quando o item não tem `logo`. */
+function useAutoArtwork(elRef,enabled,title,type){
+  const[url,setUrl]=useState('');
+  useEffect(()=>{
+    if(!enabled){setUrl('');return}
+    const key=artworkKey(type,title),cached=artworkCache.get(key);
+    if(typeof cached==='string'){setUrl(cached);return}
+    const el=elRef.current;if(!el)return;
+    let fired=false;
+    const io=new IntersectionObserver(entries=>{
+      if(fired||!entries.some(e=>e.isIntersecting))return;
+      fired=true;io.disconnect();
+      fetchArtwork(title,type).then(u=>{if(u)setUrl(u)});
+    },{rootMargin:'200px'});
+    io.observe(el);
+    return()=>io.disconnect();
+  },[enabled,title,type]);
+  return url;
+}
+
+function openDB(){return new Promise((res,rej)=>{const r=indexedDB.open(DB_NAME,DB_VERSION);r.onupgradeneeded=()=>{const d=r.result;if(!d.objectStoreNames.contains('app'))d.createObjectStore('app',{keyPath:'key'});if(!d.objectStoreNames.contains('playlists'))d.createObjectStore('playlists',{keyPath:'id'})};r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})}
+async function readStore(){try{const db=await openDB();return await new Promise((res,rej)=>{const tx=db.transaction(['app','playlists'],'readonly'),s=tx.objectStore('app').get('state'),p=tx.objectStore('playlists').getAll();tx.oncomplete=()=>res({...((s.result&&s.result.value)||{active:null,favorites:[],history:[]}),playlists:p.result||[]});tx.onerror=()=>rej(tx.error)})}catch{return EMPTY}}
+async function saveStore(s){const db=await openDB();return new Promise((res,rej)=>{const tx=db.transaction('app','readwrite');tx.objectStore('app').put({key:'state',value:{active:s.active,favorites:s.favorites||[],history:s.history||[]}});tx.oncomplete=res;tx.onerror=()=>rej(tx.error)})}
+async function savePlaylist(p){const db=await openDB();return new Promise((res,rej)=>{const tx=db.transaction('playlists','readwrite');tx.objectStore('playlists').put(p);tx.oncomplete=res;tx.onerror=()=>rej(tx.error)})}
+async function deletePlaylist(id){const db=await openDB();return new Promise((res,rej)=>{const tx=db.transaction('playlists','readwrite');tx.objectStore('playlists').delete(id);tx.oncomplete=res;tx.onerror=()=>rej(tx.error)})}
+function parseM3U(text){const lines=text.replace(/\r/g,'').split('\n').map(x=>x.trim()).filter(Boolean),out=[];let meta={};for(const line of lines){if(line.startsWith('#EXTINF')){const a={};const re=/([\w-]+)="([^"]*)"/g;let m;while((m=re.exec(line)))a[m[1]]=m[2];const c=line.indexOf(',');meta={name:c>=0?line.slice(c+1).trim():(a['tvg-name']||'Sem nome'),logo:a['tvg-logo']||'',group:a['group-title']||'Outros',tvgId:a['tvg-id']||'',headers:{}}}else if(line.startsWith('#EXTVLCOPT:')){const x=line.slice(12),eq=x.indexOf('=');if(eq>0){const k=x.slice(0,eq).toLowerCase(),v=x.slice(eq+1).replace(/^\"(.*)\"$/,'$1');meta.headers=meta.headers||{};if(k==='http-user-agent')meta.headers.userAgent=v;if(k==='http-referrer')meta.headers.referrer=v}}else if(line.startsWith('#EXTHTTP:')){try{const h=JSON.parse(line.slice(9));meta.headers={...(meta.headers||{}),...Object.fromEntries(Object.entries(h).map(([k,v])=>[k.toLowerCase()==='user-agent'?'userAgent':k.toLowerCase()==='referer'?'referrer':k,v]))}}catch{}}else if(!line.startsWith('#')){let url=line,headers={...(meta.headers||{})};if(url.includes('|')){const parts=url.split('|');url=parts.shift();for(const pair of parts.join('|').split('&')){const eq=pair.indexOf('=');if(eq<1)continue;const k=decodeURIComponent(pair.slice(0,eq)).toLowerCase(),v=decodeURIComponent(pair.slice(eq+1));if(k==='user-agent')headers.userAgent=v;else if(k==='referer'||k==='referrer')headers.referrer=v;}}const g=String(meta.group||'').toLowerCase(),n=String(meta.name||'').toLowerCase();const seriesPattern=/(?:^|[\s._-])s\d{1,2}e\d{1,3}(?:$|[\s._-])|(?:^|[\s._-])\d{1,2}x\d{1,3}(?:$|[\s._-])|(?:temporada|season|temp)[\s._-]*\d{1,2}|(?:epis[oó]dio|episode|ep)[\s._-]*\d{1,3}/i;const isMovie=/movie|filme|cinema|vod/.test(g)||url.toLowerCase().includes('/movie/');const isSeries=!isMovie&&(/series|série|season|temporada|show/.test(g)||url.toLowerCase().includes('/series/')||seriesPattern.test(n));const kind=isMovie?'movie':isSeries?'series':'live';out.push({...meta,kind,headers,url,id:`m-${out.length}-${hash(url)}`});meta={}}}return out}
+function parseSeriesEpisode(item){const raw=String(item.name||'').replace(/[\[\]()]/g,' ').replace(/\s+/g,' ').trim();let season=null,episode=null,m=raw.match(/(?:^|[\s._-])S(\d{1,2})[\s._-]*E(\d{1,3})(?:$|[\s._-])/i)||raw.match(/(?:^|[\s._-])(\d{1,2})x(\d{1,3})(?:$|[\s._-])/i)||raw.match(/(?:^|[\s._-])T(?:EMP|EMPORADA)?[\s._-]*(\d{1,2})[\s._-]*E(?:P|PISODIO)?[\s._-]*(\d{1,3})(?:$|[\s._-])/i);if(m){season=Number(m[1]);episode=Number(m[2])}if(season==null){m=raw.match(/(?:temporada|season|temp)[\s._-]*(\d{1,2})/i);if(m)season=Number(m[1])}if(episode==null){m=raw.match(/(?:epis[oó]dio|episode|ep)[\s._-]*(\d{1,3})/i);if(m)episode=Number(m[1])}const base=raw.replace(/(?:S\d{1,2}[\s._-]*E\d{1,3}|\d{1,2}x\d{1,3}|T(?:EMP|EMPORADA)?[\s._-]*\d{1,2}[\s._-]*E(?:P|PISODIO)?[\s._-]*\d{1,3})/ig,'').replace(/(?:temporada|season|temp)[\s._-]*\d{1,2}/ig,'').replace(/(?:epis[oó]dio|episode|ep)[\s._-]*\d{1,3}/ig,'').replace(/[|:_-]+[\s._-]*$/,'').replace(/^[\s._-]+|[\s._-]+$/g,'').trim();return {title:base||raw,season:season||1,episode:episode||null}}
+function buildM3USeries(items){const groups=new Map();for(const item of items){const p=parseSeriesEpisode(item);const key=(p.title||item.name).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9\s]/g,'').replace(/\s+/g,' ').trim();if(!groups.has(key))groups.set(key,{id:'m3u-series-'+hash(key),name:p.title||item.name,logo:item.logo||'',group:item.group||'Séries',kind:'series',seriesItems:[]});groups.get(key).seriesItems.push({...item,kind:'episode',season:p.season,episode:p.episode||0,seriesTitle:p.title})}return [...groups.values()]}
+function hash(s){let h=0;for(let i=0;i<s.length;i++)h=(h<<5)-h+s.charCodeAt(i)|0;return Math.abs(h).toString(36)}
+function xtreamUrl(item,source){const {server,username,password}=source.xtream;const id=item.stream_id||item.id;if(item.kind==='live')return `${server}/live/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${id}.m3u8`;if(item.kind==='movie')return `${server}/movie/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${id}.${item.container_extension||'mp4'}`;if(item.kind==='episode')return `${server}/series/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${id}.${item.container_extension||'mp4'}`;return item.url||''}
+function xtreamTsUrl(item,source){const {server,username,password}=source.xtream;const id=item.stream_id||item.id;return `${server}/live/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${id}.ts`}
+async function xtreamCall(source,action,extra={}){const r=await fetch('/api/xtream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({server:source.xtream.server,username:source.xtream.username,password:source.xtream.password,action,...extra})});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||'Falha ao consultar Xtream.');return d}
+
+function App(){const[store,setStore]=useState(null),[page,setPage]=useState('home'),[search,setSearch]=useState(''),[query,setQuery]=useState(''),[sidebar,setSidebar]=useState(false),[showAdd,setShowAdd]=useState(false),[selected,setSelected]=useState(null),[series,setSeries]=useState(null);useEffect(()=>{readStore().then(setStore)},[]);const active=store?.playlists.find(p=>p.id===store.active)||store?.playlists[0]||null;useEffect(()=>{if(active&&store&&store.active!==active.id){const n={...store,active:active.id};setStore(n);saveStore(n)}},[active,store]);if(!store)return <div className="app"><div className="welcome"><div className="welcome-content"><div className="logo-big"><img src="/icons/lockup.png" alt="NeoPlayer" className="logo-lockup"/></div><p>Carregando sua biblioteca...</p></div></div></div>;
+ const favs=new Set(store.favorites||[]),historyIds=new Set(store.history||[]);const openItem=(i)=>{if(i.kind==='series'){setSeries(i);return}setSelected(i);const h=[i.id,...(store.history||[]).filter(x=>x!==i.id)].slice(0,40),n={...store,history:h};setStore(n);saveStore(n)};const toggleFav=id=>{const n={...store,favorites:favs.has(id)?[...favs].filter(x=>x!==id):[...favs,id]};setStore(n);saveStore(n)};const add=async p=>{const n={...store,playlists:[...store.playlists,p],active:p.id};setStore(n);await savePlaylist(p);await saveStore(n);setShowAdd(false)};const remove=async id=>{const n={...store,playlists:store.playlists.filter(p=>p.id!==id),active:store.active===id?null:store.active};setStore(n);await deletePlaylist(id);await saveStore(n)};
+ return <div className="app"><Header onMenu={()=>setSidebar(!sidebar)} search={search} setSearch={setSearch} onSearch={()=>{setQuery(search);setPage('search')}} onNavigate={p=>{setPage(p);setQuery('')}} onAdd={()=>setShowAdd(true)} playlists={store.playlists} activeId={store.active} setActive={id=>{const n={...store,active:id};setStore(n);saveStore(n)}}/><Sidebar open={sidebar} page={page} setPage={setPage} close={()=>setSidebar(false)} playlists={store.playlists} active={store.active} setActive={id=>{const n={...store,active:id};setStore(n);saveStore(n)}}/><main className={sidebar?'main shifted':'main'}>{!active?<Welcome onAdd={()=>setShowAdd(true)}/>:<Content active={active} page={page} query={query} favs={favs} historyIds={historyIds} openItem={openItem} toggleFav={toggleFav} setSeries={setSeries} store={store} setStore={setStore} remove={remove} add={()=>setShowAdd(true)}/>}</main><BottomNav page={page} setPage={setPage}/>{showAdd&&<AddPlaylist onClose={()=>setShowAdd(false)} onAdd={add}/>} {selected&&<Player item={selected} onClose={()=>setSelected(null)} favorite={favs.has(selected.id)} toggleFav={()=>toggleFav(selected.id)}/>} {series&&<SeriesBrowser item={series} source={active} onClose={()=>setSeries(null)} onPlay={openItem}/>}</div>}
+
+function Content({active,page,query,favs,historyIds,openItem,toggleFav,store,setStore,remove,add}){const[category,setCategory]=useState('all');const[items,setItems]=useState(active.sourceType==='xtream'?null:(active.items||[]));const[cats,setCats]=useState([]),[catMap,setCatMap]=useState({});const[loading,setLoading]=useState(false);const[type,setType]=useState(page==='movies'?'movies':page==='series'?'series':'live');useEffect(()=>{if(active.sourceType!=='xtream'){setItems(active.items||[]);return}setItems(null);setCats([]);setCatMap({});setCategory('all');setLoading(false)},[active.id]);useEffect(()=>{if(active.sourceType!=='xtream')return;if(page==='home'){Promise.all(['live','movies','series'].map(async t=>{const cached=active.categoryCache?.[t];if(Array.isArray(cached)&&cached.length)return [t,cached];const action=t==='live'?'get_live_categories':t==='movies'?'get_vod_categories':'get_series_categories';return [t,await xtreamCall(active,action)]})).then(rows=>{const map=Object.fromEntries(rows.map(([t,d])=>[t,Array.isArray(d)?d:[]]));setCatMap(map);setCats(map.live||[])}).catch(()=>{});return}if(['live','movies','series'].includes(page)){const t=page==='movies'?'movies':page==='series'?'series':'live';setType(t);loadCategories(t)}},[active.id,page]);async function loadCategories(t){if(active.sourceType!=='xtream')return;setLoading(true);try{const cached=active.categoryCache?.[t];if(Array.isArray(cached)&&cached.length){setCats(cached);return}const action=t==='live'?'get_live_categories':t==='movies'?'get_vod_categories':'get_series_categories';const d=await xtreamCall(active,action);setCats(Array.isArray(d)?d:[])}catch(e){console.error(e)}finally{setLoading(false)}}useEffect(()=>{if(active.sourceType==='xtream'&&['live','movies','series'].includes(page)&&cats.length&&category==='all')setCategory(cats[0].category_id)},[cats,page,active.sourceType]);async function loadItems(cat='all',t=type){if(active.sourceType!=='xtream'){setItems(active.items||[]);return}setLoading(true);try{let action=t==='live'?'get_live_streams':t==='movies'?'get_vod_streams':'get_series';const d=await xtreamCall(active,action,cat==='all'?{}:{category_id:cat});const arr0=(Array.isArray(d)?d:[]).map(x=>({id:`${t}-${x.stream_id||x.series_id}`,name:x.name||x.title||'Sem nome',logo:x.stream_icon||x.cover||'',group:x.category_name||cats.find(c=>String(c.category_id)===String(x.category_id))?.category_name||'Outros',category_id:x.category_id,stream_id:x.stream_id,series_id:x.series_id,container_extension:x.container_extension,rating:x.rating_5based??x.rating,added:x.added,kind:t==='live'?'live':t==='movies'?'movie':'series',url:x.stream_id?xtreamUrl({...x,kind:t==='live'?'live':'movie'},active):'',liveTsUrl:t==='live'&&x.stream_id?xtreamTsUrl({...x,kind:'live'},active):''}));
+let arr=arr0;
+if(t==='series'&&arr0.length){
+  // Alguns provedores Xtream não agrupam as séries no servidor: get_series
+  // devolve uma linha por EPISÓDIO (cada um com nome tipo "SÉRIE S01E01"),
+  // em vez de uma linha por série. Detecta isso pelo nome e reagrupa aqui,
+  // reaproveitando o mesmo agrupador usado para listas M3U.
+  const withEp=arr0.filter(x=>parseSeriesEpisode(x).episode!=null).length;
+  if(withEp/arr0.length>0.4){
+    arr=buildM3USeries(arr0).map(g=>({...g,id:'xflat-'+g.id,category_id:g.seriesItems[0]?.category_id,group:g.seriesItems[0]?.group||g.group}));
+  }
+}
+setItems(arr)}catch(e){setItems([])}finally{setLoading(false)}}useEffect(()=>{if(active.sourceType==='xtream'&&page!=='home'&&page!=='favorites'&&page!=='history'&&page!=='playlists'&&page!=='settings'&&page!=='search')loadItems(category,type)},[category,type,active.id,page]);useEffect(()=>{if(active.sourceType!=='xtream'||page!=='search'||!query.trim())return;let cancelled=false;setLoading(true);Promise.all(['get_live_streams','get_vod_streams','get_series'].map(action=>xtreamCall(active,action))).then(rows=>{if(cancelled)return;const live=Array.isArray(rows[0])?rows[0].map(x=>({id:`live-${x.stream_id}`,name:x.name||'Sem nome',logo:x.stream_icon||'',group:x.category_name||'Outros',category_id:x.category_id,stream_id:x.stream_id,kind:'live',url:x.stream_id?xtreamUrl({...x,kind:'live'},active):'',liveTsUrl:x.stream_id?xtreamTsUrl({...x,kind:'live'},active):''})):[];const movies=Array.isArray(rows[1])?rows[1].map(x=>({id:`movies-${x.stream_id}`,name:x.name||'Sem nome',logo:x.stream_icon||x.cover||'',group:x.category_name||'Outros',category_id:x.category_id,stream_id:x.stream_id,container_extension:x.container_extension,rating:x.rating_5based??x.rating,added:x.added,kind:'movie',url:x.stream_id?xtreamUrl({...x,kind:'movie'},active):''})):[];const series=Array.isArray(rows[2])?rows[2].map(x=>({id:`series-${x.series_id}`,name:x.name||'Sem nome',logo:x.cover||'',group:x.category_name||'Outros',category_id:x.category_id,series_id:x.series_id,kind:'series'})):[];setItems([...live,...movies,...series])}).catch(()=>{if(!cancelled)setItems([])}).finally(()=>{if(!cancelled)setLoading(false)});return()=>{cancelled=true}},[active.id,page,query]);
+ const all=active.sourceType==='xtream'?(items||[]):(active.items||[]);const seriesCatalog=active.sourceType==='xtream'?all:buildM3USeries(all.filter(i=>i.kind==='series'));const staticKind=page==='movies'?'Filmes':page==='series'?'Séries':'TV ao Vivo';const staticKindMap={'Filmes':'movie','Séries':'series','TV ao Vivo':'live'};const staticCats=active.sourceType==='xtream'?cats:[...new Set((page==='series'?seriesCatalog:all.filter(i=>i.kind===staticKindMap[staticKind])).map(i=>i.group||'Outros'))].map(name=>({category_id:name,category_name:name}));let visible=all;if(page==='live')visible=all.filter(i=>i.kind==='live');if(page==='movies')visible=all.filter(i=>i.kind==='movie');if(page==='series')visible=active.sourceType==='xtream'?all.filter(i=>i.kind==='series'):seriesCatalog;if(['live','movies','series'].includes(page)&&category!=='all')visible=visible.filter(i=>String(i.category_id||i.group)===String(category));if(page==='favorites')visible=all.filter(i=>favs.has(i.id));if(page==='history')visible=all.filter(i=>historyIds.has(i.id));if(page==='search')visible=all.filter(i=>`${i.name} ${i.group}`.toLowerCase().includes(query.toLowerCase()));
+const removeHistory=id=>{const n={...store,history:(store.history||[]).filter(x=>x!==id)};setStore(n);saveStore(n)};
+ if(page==='home')return <HomePage active={active} items={all} favs={favs} historyIds={historyIds} openItem={openItem} toggleFav={toggleFav} cats={cats} catMap={catMap} loading={loading} removeHistory={removeHistory}/>;if(page==='playlists')return <PlaylistManager playlists={store.playlists} active={store.active} setActive={id=>{const n={...store,active:id};setStore(n);saveStore(n)}} add={add} remove={remove}/>;if(page==='settings')return <SettingsPage store={store} setStore={setStore}/>;return <Catalog title={page==='live'?'TV ao Vivo':page==='movies'?'Filmes':page==='series'?'Séries':page==='favorites'?'Meus favoritos':page==='history'?'Continuar assistindo':`Resultados para “${query}”`} items={visible} favs={favs} openItem={openItem} toggleFav={toggleFav} onRemove={page==='history'?removeHistory:undefined} showSort={['live','movies','series','favorites','history','search'].includes(page)||page==='search'} cats={['live','movies','series'].includes(page)?(active.sourceType==='xtream'?cats:staticCats):[]} category={category} setCategory={setCategory} loadMore={active.sourceType==='xtream'?()=>loadItems(category,type):null} loading={loading}/>}
+
+function hashHue(str){let h=0;for(let i=0;i<String(str).length;i++)h=(h*31+String(str).charCodeAt(i))>>>0;return h%360}
+
+function PlaylistSwitcher({playlists,activeId,setActive,onAdd,onManage}){
+  const[open,setOpen]=useState(false);
+  const ref=useRef(null);
+  useEffect(()=>{
+    if(!open)return;
+    const onDoc=e=>{if(ref.current&&!ref.current.contains(e.target))setOpen(false)};
+    const onEsc=e=>{if(e.key==='Escape')setOpen(false)};
+    document.addEventListener('mousedown',onDoc);document.addEventListener('keydown',onEsc);
+    return()=>{document.removeEventListener('mousedown',onDoc);document.removeEventListener('keydown',onEsc)};
+  },[open]);
+  if(!playlists.length)return <button className="icon-btn" onClick={onAdd} aria-label="Adicionar playlist"><Plus/></button>;
+  const active=playlists.find(p=>p.id===activeId)||playlists[0];
+  const initial=(active?.name||'?').trim().charAt(0).toUpperCase()||'?';
+  return <div className="pl-switcher" ref={ref}>
+    <button className="pl-trigger" onClick={()=>setOpen(o=>!o)} aria-haspopup="true" aria-expanded={open}>
+      <span className="pl-avatar" style={{'--h':hashHue(active?.id||active?.name||'')}}>{initial}</span>
+      <span className="pl-trigger-name">{active?.name||'Playlist'}</span>
+      <ChevronDown size={15} className={`chev${open?' rot':''}`}/>
+    </button>
+    {open&&<div className="pl-menu" role="menu">
+      <div className="pl-menu-title">{playlists.length} playlist{playlists.length===1?'':'s'}</div>
+      {playlists.map(p=><button key={p.id} role="menuitemradio" aria-checked={p.id===activeId} className={`pl-item${p.id===activeId?' is-active':''}`} onClick={()=>{setActive(p.id);setOpen(false)}}>
+        <span className="pl-avatar sm" style={{'--h':hashHue(p.id||p.name||'')}}>{(p.name||'?').trim().charAt(0).toUpperCase()||'?'}</span>
+        <span className="pl-item-name">{p.name}</span>
+        {p.id===activeId&&<CheckCircle2 size={15}/>}
+      </button>)}
+      <div className="pl-menu-sep"/>
+      <button className="pl-action" onClick={()=>{setOpen(false);onAdd()}}><Plus size={15}/>Adicionar playlist</button>
+      <button className="pl-action" onClick={()=>{setOpen(false);onManage()}}><SlidersHorizontal size={15}/>Gerenciar playlists</button>
+    </div>}
+  </div>
+}
+
+function Header({onMenu,search,setSearch,onSearch,onAdd,onNavigate,playlists,activeId,setActive}){return <header className="header"><button className="icon-btn mobile-only" onClick={onMenu}><Menu/></button><button className="brand" onClick={()=>onNavigate('home')}><img src="/icons/mark-transparent.png" alt="" className="brand-mark"/><span>NeoPlayer</span></button><nav className="desktop-nav"><button onClick={()=>onNavigate('home')}>Início</button><button onClick={()=>onNavigate('live')}>TV ao Vivo</button><button onClick={()=>onNavigate('movies')}>Filmes</button><button onClick={()=>onNavigate('series')}>Séries</button></nav><div className="header-actions"><div className="searchbox"><Search size={18}/><input value={search} onChange={e=>setSearch(e.target.value)} onKeyDown={e=>e.key==='Enter'&&onSearch()} placeholder="Buscar..."/><button onClick={onSearch} aria-label="Buscar"><Search size={16}/></button></div><PlaylistSwitcher playlists={playlists} activeId={activeId} setActive={setActive} onAdd={onAdd} onManage={()=>onNavigate('playlists')}/></div></header>}
+function Sidebar({open,page,setPage,close,playlists,active,setActive}){const go=p=>{setPage(p);close()};return <aside className={`sidebar ${open?'open':''}`}><div className="side-title">Navegação</div><Side icon={<Home/>} text="Início" active={page==='home'} onClick={()=>go('home')}/><Side icon={<Tv/>} text="TV ao Vivo" active={page==='live'} onClick={()=>go('live')}/><Side icon={<Film/>} text="Filmes" active={page==='movies'} onClick={()=>go('movies')}/><Side icon={<Layers3/>} text="Séries" active={page==='series'} onClick={()=>go('series')}/><Side icon={<Star/>} text="Favoritos" active={page==='favorites'} onClick={()=>go('favorites')}/><Side icon={<Clock3/>} text="Histórico" active={page==='history'} onClick={()=>go('history')}/><div className="side-title playlist-title">Playlists</div>{playlists.map(p=><button className={`playlist-link ${active===p.id?'selected':''}`} key={p.id} onClick={()=>{setActive(p.id);go('home')}}><span className="dot"/>{p.name}</button>)}<Side icon={<Link2/>} text="Gerenciar playlists" active={page==='playlists'} onClick={()=>go('playlists')}/><Side icon={<Settings/>} text="Configurações" active={page==='settings'} onClick={()=>go('settings')}/></aside>}
+function Side({icon,text,active,onClick}){return <button className={`side-link ${active?'active':''}`} onClick={onClick}>{icon}<span>{text}</span></button>}
+function Welcome({onAdd}){return <section className="welcome"><div className="welcome-glow"/><div className="welcome-content"><div className="logo-big"><img src="/icons/lockup.png" alt="NeoPlayer" className="logo-lockup"/></div><h1>Seu entretenimento,<br/><b>em um só lugar.</b></h1><p>Adicione M3U/M3U8, arquivo ou Xtream Codes e organize o conteúdo por categorias.</p><button className="primary-btn" onClick={onAdd}><Plus/>Adicionar playlist</button></div></section>}
+function HomePage({active,items,favs,historyIds,openItem,toggleFav,cats,catMap,loading,removeHistory}){const history=items.filter(i=>historyIds.has(i.id)),kindRows=[['TV ao Vivo','live'],['Filmes','movies'],['Séries','series']];return <div>{items[0]&&<Hero item={items[0]} onPlay={()=>openItem(items[0])}/>} {history.length>0&&<Row title="Continuar assistindo" items={history.slice(0,14)} openItem={openItem} favs={favs} toggleFav={toggleFav} onRemove={removeHistory}/>} {active.sourceType==='xtream'?kindRows.map(([title,k])=><CategoryPreview key={k} title={title} active={active} type={k} cats={catMap?.[k]||[]} favs={favs} openItem={openItem} toggleFav={toggleFav}/>):<StaticHome items={items} favs={favs} openItem={openItem} toggleFav={toggleFav}/>} </div>}
+function StaticHome({items,favs,openItem,toggleFav}){const groups=[...new Set(items.map(i=>i.group||'Outros'))].slice(0,8);return <>{groups.map(g=><Row key={g} title={g} items={items.filter(i=>(i.group||'Outros')===g).slice(0,14)} openItem={openItem} favs={favs} toggleFav={toggleFav}/>)}</>}
+function CategoryPreview({title,active,type,cats,favs,openItem,toggleFav}){const[items,setItems]=useState([]),[loading,setLoading]=useState(Boolean(cats?.length));useEffect(()=>{if(!cats?.length){setLoading(false);return}const first=Array.isArray(cats)&&cats[0];const action=type==='live'?'get_live_streams':type==='movies'?'get_vod_streams':'get_series';xtreamCall(active,action,first?.category_id?{category_id:first.category_id}:{}).then(d=>setItems((Array.isArray(d)?d:[]).slice(0,14).map(x=>({id:`${type}-${x.stream_id||x.series_id}`,name:x.name||'Sem nome',logo:x.stream_icon||x.cover||'',group:x.category_name||first?.category_name||'Outros',kind:type==='live'?'live':type==='movies'?'movie':'series',stream_id:x.stream_id,series_id:x.series_id,container_extension:x.container_extension,rating:x.rating_5based??x.rating,added:x.added,url:x.stream_id?xtreamUrl({...x,kind:type==='live'?'live':type==='series'?'series':'movie'},active):''})))).catch(()=>{}).finally(()=>setLoading(false))},[active.id,type,cats]);if(!loading&&!items.length)return null;return <Row title={title+(cats?.[0]?.category_name?` • ${cats[0].category_name}`:'')} items={items} openItem={openItem} favs={favs} toggleFav={toggleFav} loading={loading}/>}
+function Hero({item,onPlay}){
+  const bgRef=useRef(null);
+  const{title,year}=useMemo(()=>displayTitle(item.name),[item.name]);
+  const needsArt=!item.logo&&(item.kind==='movie'||item.kind==='series');
+  const auto=useAutoArtwork(bgRef,needsArt,title,item.kind==='series'?'tv':'movie');
+  const backdrop=safeImg(item.logo)||auto;
+  return <section className="hero" ref={bgRef}>
+    {backdrop&&<div className="hero-bg" style={{backgroundImage:`url(${backdrop})`}}/>}
+    <div className="hero-scrim"/>
+    <div className="hero-overlay"/>
+    <div className="hero-content">
+      <span className="eyebrow">{item.kind==='live'?'AO VIVO AGORA':'DESTAQUE'}</span>
+      <h1>{title}</h1>
+      <p>{item.group||'Conteúdo'}{year?` • ${year}`:''}</p>
+      <button className="primary-btn" onClick={onPlay}><Play size={19} fill="currentColor"/>Assistir agora</button>
+    </div>
+  </section>
+}
+function Row({title,items,openItem,favs,toggleFav,loading,onRemove}){if(!loading&&!items.length)return null;return <section className="row-section"><div className="row-head"><h2>{title}</h2><ChevronRight size={19}/></div><div className="cards-scroll">{loading?[1,2,3,4,5,6].map(x=><div className="card skeleton-card" key={x}/>):items.map(i=><Card key={i.id} item={i} openItem={openItem} favorite={favs.has(i.id)} toggleFav={toggleFav} onRemove={onRemove}/>)}</div></section>}
+function safeImg(url){if(!url)return'';if(/^https:/i.test(url))return url;if(/^http:/i.test(url)&&typeof window!=='undefined'&&window.location.protocol==='https:')return`/api/proxy?url=${encodeURIComponent(url)}`;return url}
+function Card({item,openItem,favorite,toggleFav,onRemove}){
+  const posterRef=useRef(null);
+  const{title,year}=useMemo(()=>displayTitle(item.name),[item.name]);
+  const needsArt=!item.logo&&(item.kind==='movie'||item.kind==='series');
+  const auto=useAutoArtwork(posterRef,needsArt,title,item.kind==='series'?'tv':'movie');
+  const poster=safeImg(item.logo)||auto;
+  return <article className="card">
+    <button className="poster" ref={posterRef} onClick={()=>openItem(item)}>
+      {poster?<img loading="lazy" src={poster} alt="" onError={e=>e.currentTarget.style.display='none'}/>:<div className="poster-fallback"><Play size={20} fill="currentColor"/></div>}
+      <div className="poster-shade"/>
+      <span className="play-float"><Play size={18} fill="currentColor"/></span>
+      {year&&<span className="poster-badge">{year}</span>}
+    </button>
+    {onRemove&&<button className="remove-mini" onClick={e=>{e.stopPropagation();onRemove(item.id)}} aria-label="Remover de Continuar assistindo" title="Remover"><X size={14}/></button>}
+    <button className={`fav-mini ${favorite?'is-fav':''}`} onClick={()=>toggleFav(item.id)}><Star size={15} fill={favorite?'currentColor':'none'}/></button>
+    <div className="card-title" title={title}>{title}</div>
+    <div className="card-meta">{item.group||'Outros'}</div>
+  </article>
+}
+function CategoryBar({cats,category,setCategory}){if(!cats?.length)return null;return <div className="category-bar"><button className={category==='all'?'active':''} onClick={()=>setCategory('all')}>Todos</button>{cats.map(c=><button key={c.category_id} className={String(category)===String(c.category_id)?'active':''} onClick={()=>setCategory(c.category_id)}>{c.category_name}</button>)}</div>}
+const SORTS=[['default','Adicionados recentemente'],['az','Título: A - Z'],['za','Título: Z - A'],['rating','Melhores avaliados']];
+function sortItems(items,sort){
+  if(sort==='default')return items;
+  const arr=[...items];
+  if(sort==='az')return arr.sort((a,b)=>(a.name||'').localeCompare(b.name||'','pt-BR',{numeric:true}));
+  if(sort==='za')return arr.sort((a,b)=>(b.name||'').localeCompare(a.name||'','pt-BR',{numeric:true}));
+  if(sort==='rating')return arr.sort((a,b)=>(Number(b.rating)||0)-(Number(a.rating)||0)||(a.name||'').localeCompare(b.name||'','pt-BR'));
+  return arr;
+}
+function Catalog({title,items,openItem,favs,toggleFav,cats,category,setCategory,loadMore,loading,onRemove,showSort}){const[limit,setLimit]=useState(60);const[sort,setSort]=useState('default');useEffect(()=>setLimit(60),[category,title,sort]);const ordered=useMemo(()=>sortItems(items,sort),[items,sort]);const shown=ordered.slice(0,limit);return <section className="catalog"><div className="catalog-title"><div><span className="eyebrow">BIBLIOTECA</span><h1>{title}</h1></div><div className="catalog-tools">{showSort&&<label className="sort-select"><ArrowDownUp size={15}/><select value={sort} onChange={e=>setSort(e.target.value)} aria-label="Ordenar por">{SORTS.map(([v,l])=><option key={v} value={v}>{l}</option>)}</select></label>}<span className="count">{items.length.toLocaleString('pt-BR')} itens</span></div></div><CategoryBar cats={cats} category={category} setCategory={setCategory}/><div className="grid">{shown.map(i=><Card key={i.id} item={i} openItem={openItem} favorite={favs.has(i.id)} toggleFav={toggleFav} onRemove={onRemove}/>)}</div>{loading&&<div className="loading-line"><RefreshCw className="spin"/> Carregando conteúdo...</div>}{!loading&&!shown.length&&<Empty text="Nenhum conteúdo encontrado."/>}{shown.length<ordered.length&&<button className="secondary-btn load-more" onClick={()=>setLimit(x=>x+60)}>Carregar mais</button>}</section>}
+function Empty({text}){return <div className="empty"><Info/><p>{text}</p></div>}
+function PlaylistManager({playlists,active,setActive,add,remove}){return <section className="settings-page"><div className="catalog-title"><div><span className="eyebrow">BIBLIOTECA</span><h1>Minhas playlists</h1></div><button className="primary-btn" onClick={add}><Plus/>Adicionar</button></div><div className="playlist-grid">{playlists.map(p=><div className={`playlist-card ${active===p.id?'current':''}`} key={p.id}><div className="playlist-icon">▶</div><div><h3>{p.name}</h3><p>{p.sourceType==='xtream'?'Xtream Codes':'Playlist'} • {p.items?.length||0} itens carregados</p></div><div className="playlist-actions"><button onClick={()=>setActive(p.id)}>Abrir</button><button className="danger" onClick={()=>remove(p.id)}><Trash2 size={17}/></button></div></div>)}</div>{!playlists.length&&<Empty text="Adicione sua primeira playlist."/>}</section>}
+function SettingsPage({store,setStore}){return <section className="settings-page"><span className="eyebrow">PREFERÊNCIAS</span><h1>Configurações</h1><div className="settings-card"><div><h3>Biblioteca local</h3><p>O NeoPlayer usa IndexedDB para manter dados locais e evitar o limite pequeno do localStorage.</p></div><button className="secondary-btn" onClick={()=>{const n={...store,history:[]};setStore(n);saveStore(n)}}><RefreshCw/>Limpar histórico</button></div></section>}
+
+function AddPlaylist({onClose,onAdd}){const[tab,setTab]=useState('url'),[name,setName]=useState('Minha Playlist'),[url,setUrl]=useState(''),[server,setServer]=useState(''),[username,setUsername]=useState(''),[password,setPassword]=useState(''),[showPassword,setShowPassword]=useState(false),[loading,setLoading]=useState(false),[error,setError]=useState(''),[success,setSuccess]=useState(''),[tested,setTested]=useState(null);const reset=()=>{setError('');setSuccess('');setTested(null)};const norm=v=>{let x=v.trim();if(!x)return'';if(!/^https?:\/\//i.test(x))x='http://'+x;return x.replace(/\/+$/,'')};async function fetchM3U(u){const r=await fetch('/api/proxy?mode=playlist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:u})});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||'Falha ao carregar playlist.');const items=parseM3U(d.content||'');if(!items.length)throw new Error('Nenhum conteúdo encontrado.');return items}async function submit(){reset();if(!url.trim())return setError('Cole uma URL M3U/M3U8.');setLoading(true);try{const items=await fetchM3U(url.trim());onAdd({id:crypto.randomUUID(),name:name.trim()||'Minha Playlist',url:url.trim(),items,createdAt:Date.now(),sourceType:'m3u'})}catch(e){setError(e.message)}finally{setLoading(false)}}async function test(){reset();const s=norm(server);if(!s||!username||!password)return setError('Preencha servidor, usuário e senha.');setLoading(true);try{const cats=await Promise.all([xtreamCall({xtream:{server:s,username,password}},'get_live_categories'),xtreamCall({xtream:{server:s,username,password}},'get_vod_categories'),xtreamCall({xtream:{server:s,username,password}},'get_series_categories')]);const source={xtream:{server:s,username,password}};setTested({source,cats,counts:[cats[0].length,cats[1].length,cats[2].length]});setSuccess(`Conexão validada • ${cats[0].length} categorias TV • ${cats[1].length} filmes • ${cats[2].length} séries`)}catch(e){setError(e.message)}finally{setLoading(false)}}function addXtream(){if(!tested)return;onAdd({id:crypto.randomUUID(),name:name.trim()||'Minha Playlist',url:tested.source.xtream.server,items:[],createdAt:Date.now(),sourceType:'xtream',xtream:tested.source.xtream,categoryCache:{live:tested.cats[0],movies:tested.cats[1],series:tested.cats[2]}})}async function file(e){const f=e.target.files?.[0];if(!f)return;setLoading(true);try{const items=parseM3U(await f.text());onAdd({id:crypto.randomUUID(),name:name.trim()||f.name,url:'arquivo local',items,createdAt:Date.now(),sourceType:'file'})}catch(e){setError(e.message)}finally{setLoading(false)}}return <div className="modal-backdrop"><div className="modal xtream-modal"><button className="modal-close" onClick={onClose}><X/></button><span className="eyebrow">NOVA PLAYLIST</span><h2>Adicionar conteúdo</h2><p className="modal-sub">M3U/M3U8, arquivo ou Xtream Codes.</p><label>Nome<input value={name} onChange={e=>{setName(e.target.value);setTested(null)}}/></label><div className="tabs"><button className={tab==='url'?'active':''} onClick={()=>{setTab('url');reset()}}><Link2/>URL</button><button className={tab==='file'?'active':''} onClick={()=>{setTab('file');reset()}}><Upload/>Arquivo</button><button className={tab==='xtream'?'active':''} onClick={()=>{setTab('xtream');reset()}}><SlidersHorizontal/>Xtream</button></div>{tab==='url'&&<label>URL M3U/M3U8<input value={url} onChange={e=>setUrl(e.target.value)} placeholder="https://exemplo.com/playlist.m3u"/></label>}{tab==='file'&&<label className="filebox"><Upload/><span>Selecionar arquivo M3U</span><input type="file" accept=".m3u,.m3u8,.txt" onChange={file}/></label>}{tab==='xtream'&&<div className="xtream-fields"><label>Servidor<input value={server} onChange={e=>{setServer(e.target.value);setTested(null)}} placeholder="http://servidor.com:8080"/></label><label>Usuário<input value={username} onChange={e=>{setUsername(e.target.value);setTested(null)}}/></label><label>Senha<div className="password-wrap"><input type={showPassword?'text':'password'} value={password} onChange={e=>{setPassword(e.target.value);setTested(null)}}/><button type="button" onClick={()=>setShowPassword(!showPassword)}>{showPassword?<EyeOff/>:<Eye/>}</button></div></label>{tested&&<div className="xtream-stats"><CheckCircle2/><div><strong>Conexão validada</strong><span>{tested.counts[0]} categorias TV • {tested.counts[1]} filmes • {tested.counts[2]} séries</span></div></div>}</div>}{error&&<div className="error">{error}</div>}{success&&<div className="success">{success}</div>}{tab==='url'&&<button className="primary-btn full" disabled={loading} onClick={submit}>{loading?<><RefreshCw className="spin"/>Lendo playlist...</>:<><Plus/>Adicionar playlist</>}</button>}{tab==='xtream'&&(!tested?<button className="primary-btn full" disabled={loading} onClick={test}>{loading?<><RefreshCw className="spin"/>Validando...</>:<><CheckCircle2/>Testar conexão</>}</button>:<button className="primary-btn full" onClick={addXtream}><Plus/>Adicionar playlist</button>)}</div></div>}
+
+function SeriesBrowser({item,source,onClose,onPlay}){const posterRef=useRef(null);const{title:seriesTitle}=useMemo(()=>displayTitle(item.name),[item.name]);const seriesArt=useAutoArtwork(posterRef,!item.logo,seriesTitle,'tv');const seriesPoster=safeImg(item.logo)||seriesArt;const[data,setData]=useState(null),[loading,setLoading]=useState(!item.seriesItems&&source.sourceType==='xtream'),[err,setErr]=useState(''),[season,setSeason]=useState('');useEffect(()=>{let cancelled=false;setErr('');if(!item.seriesItems&&source.sourceType==='xtream'){setLoading(true);xtreamCall(source,'get_series_info',{series_id:item.series_id}).then(d=>{if(cancelled)return;setData(d);const ks=Object.keys(d?.episodes||{}).sort((a,b)=>Number(a)-Number(b));setSeason(ks[0]||'')}).catch(e=>{if(!cancelled)setErr(e.message||'Falha ao carregar série.')}).finally(()=>{if(!cancelled)setLoading(false)})}else{const grouped={};for(const ep of item.seriesItems||[]){const k=String(ep.season||1);(grouped[k]||(grouped[k]=[])).push(ep)}for(const k of Object.keys(grouped))grouped[k].sort((a,b)=>(a.episode||0)-(b.episode||0));const ks=Object.keys(grouped).sort((a,b)=>Number(a)-Number(b));setData({episodes:grouped});setSeason(ks[0]||'');setLoading(false)}return()=>{cancelled=true}},[item.id,source.id,source.sourceType]);const eps=data?.episodes?.[season]||[];const seasons=Object.keys(data?.episodes||{}).sort((a,b)=>Number(a)-Number(b));return <div className="modal-backdrop"><div className="modal series-modal"><button className="modal-close" onClick={onClose}><X/></button><div className="series-detail-head"><div className="series-poster" ref={posterRef}>{seriesPoster?<img src={seriesPoster} alt=""/>:<div className="poster-fallback"><Layers3 size={26}/></div>}</div><div><span className="eyebrow">SÉRIE • {item.group||'CATÁLOGO'}</span><h2>{seriesTitle}</h2><p>{seasons.length} temporada{seasons.length===1?'':'s'}</p></div></div>{loading?<div className="loading-line"><RefreshCw className="spin"/>Carregando temporadas...</div>:err?<div className="error">{err}</div>:!seasons.length?<div className="empty">Nenhuma temporada encontrada.</div>:<><div className="season-tabs">{seasons.map(k=><button key={k} className={season===k?'active':''} onClick={()=>setSeason(k)}><strong>Temporada {k}</strong><span>{(data.episodes[k]||[]).length} episódios</span></button>)}</div><div className="episode-list">{eps.map((ep,i)=>{const no=ep.episode_num||ep.episode||i+1;return <button key={ep.id||ep.url||i} onClick={()=>{onClose();if(!item.seriesItems&&source.sourceType==='xtream')onPlay({id:'ep-'+ep.id,name:seriesTitle+' — '+(ep.title||'Episódio '+no),group:'Temporada '+season,kind:'episode',url:xtreamUrl({kind:'episode',id:ep.id,container_extension:ep.container_extension||'mp4'},source),logo:item.logo});else onPlay({...ep,kind:'episode',name:ep.name||seriesTitle+' — Episódio '+no,group:'Temporada '+season})}}><Play size={15}/><span><b>Episódio {no}</b><small>{ep.title||ep.name||'Episódio '+no}</small></span><ChevronRight size={15}/></button>})}</div></>}</div></div>}function Player({item,onClose,favorite,toggleFav}){
+  const videoRef=useRef(null),shellRef=useRef(null),hideTimer=useRef(null);
+  const[playing,setPlaying]=useState(true);
+  const[muted,setMuted]=useState(false);
+  const[full,setFull]=useState(false);
+  const[error,setError]=useState('');
+  const[current,setCurrent]=useState(0);
+  const[duration,setDuration]=useState(0);
+  const[retry,setRetry]=useState(0);
+  const[uiVisible,setUiVisible]=useState(true);
+  const[fit,setFit]=useState(()=>localStorage.getItem('np-fit')||'contain');
+  const[fitOpen,setFitOpen]=useState(false);
+  const isLive=item.kind==='live';
+
+  useEffect(()=>{localStorage.setItem('np-fit',fit)},[fit]);
+
+  // Auto-ocultar: some depois de 3s parado, volta com mouse/toque/teclado.
+  const wake=useCallback(()=>{
+    setUiVisible(true);
+    clearTimeout(hideTimer.current);
+    hideTimer.current=setTimeout(()=>{setUiVisible(false);setFitOpen(false)},3000);
+  },[]);
+  useEffect(()=>{wake();return()=>clearTimeout(hideTimer.current)},[wake]);
+  useEffect(()=>{if(!playing||error){clearTimeout(hideTimer.current);setUiVisible(true)}else wake()},[playing,error,wake]);
+
+  useEffect(()=>{
+    const v=videoRef.current;if(!v)return;
+    let hls,mpegtsPlayer,killed=false,mediaErrors=0;
+    setError('');setCurrent(0);setDuration(0);
+    const src=`/api/proxy?url=${encodeURIComponent(item.url)}`;
+    // O mpegts.js busca o stream dentro de um Web Worker, e lá uma URL relativa
+    // não tem base para ser resolvida ("Failed to parse URL from /api/proxy?...").
+    // Precisa ser absoluta.
+    const absSrc=new URL(src,window.location.href).href;
+    const direct=/\.(mp4|mkv|webm|mov|m4v)(\?|$)/i.test(item.url);
+
+    function startMpegts(useWorker=true){
+      if(killed)return;
+      if(mpegts.getFeatureList().mseLivePlayback){
+        mpegtsPlayer=mpegts.createPlayer({type:'mpegts',isLive:true,url:absSrc},{enableWorker:useWorker,liveBufferLatencyChasing:true,lazyLoadMaxDuration:30,stashInitialSize:128});
+        mpegtsPlayer.attachMediaElement(v);
+        mpegtsPlayer.load();
+        mpegtsPlayer.play().catch(()=>{});
+        mpegtsPlayer.on(mpegts.Events.ERROR,(type,detail,info)=>{
+          if(killed)return;
+          // Se o worker falhar (alguns ambientes o bloqueiam), tenta sem worker.
+          if(useWorker){try{mpegtsPlayer.destroy()}catch{}mpegtsPlayer=null;startMpegts(false);return}
+          setError(`Não foi possível reproduzir este canal.${info?.msg?` (${info.msg})`:''}`);
+        });
+      }else{
+        setError('Este navegador não consegue reproduzir este formato de canal.');
+      }
+    }
+
+    function startHls(){
+      if(killed)return;
+      if(Hls.isSupported()){
+        hls=new Hls({enableWorker:true,lowLatencyMode:isLive,maxBufferLength:isLive?12:30,liveSyncDurationCount:3,manifestLoadingMaxRetry:2});
+        hls.loadSource(src);
+        hls.attachMedia(v);
+        hls.on(Hls.Events.MANIFEST_PARSED,()=>v.play().catch(()=>{}));
+        hls.on(Hls.Events.ERROR,(_,d)=>{
+          if(!d.fatal||killed)return;
+          if(d.type===Hls.ErrorTypes.MEDIA_ERROR){
+            mediaErrors+=1;
+            if(mediaErrors>3){setError('Não foi possível decodificar este vídeo. O formato (codec) pode não ser suportado neste navegador.');hls.destroy();hls=null;return}
+            hls.recoverMediaError();return
+          }
+          if(d.type===Hls.ErrorTypes.NETWORK_ERROR){hls.startLoad();return}
+          setError('Não foi possível reproduzir este conteúdo.');
+        });
+      }else if(v.canPlayType('application/vnd.apple.mpegurl')){
+        v.src=src;v.play().catch(()=>{});
+      }else{
+        setError('Este navegador não suporta HLS.');
+      }
+    }
+
+    if(direct){v.src=src;v.play().catch(()=>{});return()=>{killed=true}}
+
+    // Descobre o que o servidor realmente devolve antes de escolher o motor.
+    // Painéis IPTV costumam servir TS puro numa URL .m3u8; entregar isso ao
+    // hls.js faz ele baixar pra sempre sem nunca tocar nem dar erro.
+    fetch(`/api/proxy?probe=1&url=${encodeURIComponent(item.url)}`)
+      .then(r=>r.ok?r.json():Promise.reject(new Error('probe')))
+      .then(d=>{if(killed)return;d.kind==='hls'?startHls():startMpegts()})
+      .catch(()=>{if(!killed)startHls()});
+
+    return()=>{killed=true;hls?.destroy();mpegtsPlayer?.destroy()}
+  },[item.url,retry]);
+
+  useEffect(()=>{
+    const v=videoRef.current;if(!v)return;
+    const onTime=()=>setCurrent(v.currentTime);
+    const onMeta=()=>setDuration(Number.isFinite(v.duration)?v.duration:0);
+    v.addEventListener('timeupdate',onTime);
+    v.addEventListener('durationchange',onMeta);
+    v.addEventListener('loadedmetadata',onMeta);
+    return()=>{v.removeEventListener('timeupdate',onTime);v.removeEventListener('durationchange',onMeta);v.removeEventListener('loadedmetadata',onMeta)}
+  },[item.url]);
+
+  const toggle=()=>{const v=videoRef.current;if(!v)return;v.paused?v.play().catch(()=>{}):v.pause();wake()};
+  const seekBy=delta=>{const v=videoRef.current;if(!v||isLive)return;v.currentTime=Math.max(0,Math.min((v.duration||0)-0.5,v.currentTime+delta));wake()};
+  const seekTo=t=>{const v=videoRef.current;if(!v||isLive)return;v.currentTime=t};
+  const fmt=s=>{if(!Number.isFinite(s)||s<0)return'0:00';const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=Math.floor(s%60);return h?`${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`:`${m}:${String(sec).padStart(2,'0')}`};
+  const fullscreen=async()=>{const e=shellRef.current;if(!document.fullscreenElement){await e?.requestFullscreen?.();setFull(true)}else{await document.exitFullscreen?.();setFull(false)}wake()};
+
+  useEffect(()=>{
+    const onKey=e=>{
+      if(e.key===' '||e.key==='k'){e.preventDefault();toggle()}
+      else if(e.key==='ArrowRight')seekBy(25);
+      else if(e.key==='ArrowLeft')seekBy(-25);
+      else if(e.key==='f')fullscreen();
+      else if(e.key==='m'){setMuted(m=>!m);wake()}
+      else if(e.key==='Escape'&&!document.fullscreenElement)onClose();
+    };
+    window.addEventListener('keydown',onKey);
+    return()=>window.removeEventListener('keydown',onKey);
+  });
+
+  const FITS=[['contain','Ajustar (padrão)'],['cover','Preencher tela'],['fill','Esticar'],['none','Tamanho original']];
+
+  return <div className="player-overlay"><div className={`player-shell${uiVisible?'':' ui-hidden'}`} ref={shellRef}
+      onMouseMove={wake} onTouchStart={wake} onClick={e=>{if(!uiVisible){e.stopPropagation();wake()}}}>
+    <video ref={videoRef} playsInline muted={muted} style={{objectFit:fit}} onClick={toggle} onPlay={()=>setPlaying(true)} onPause={()=>setPlaying(false)}/>
+    <div className="player-gradient"/>
+    <button className="player-close" onClick={onClose}><X/></button>
+    <div className="player-info">
+      <span className="eyebrow">{item.group||'CONTEÚDO'}</span>
+      <h2>{item.name}</h2>
+      {error&&<div className="player-error-box"><p className="player-error">{error}</p><button className="secondary-btn" onClick={()=>setRetry(r=>r+1)}><RefreshCw size={15}/>Tentar novamente</button></div>}
+    </div>
+    <div className="player-controls">
+      {!isLive&&<div className="seekbar-wrap">
+        <span>{fmt(current)}</span>
+        <input type="range" className="seekbar" min="0" max={duration||0} step="0.1" value={current}
+          onChange={e=>seekTo(Number(e.target.value))}/>
+        <span>{fmt(duration)}</span>
+      </div>}
+      <div className="control-row">
+        <button onClick={toggle}>{playing?<Pause/>:<Play fill="currentColor"/>}</button>
+        {!isLive&&<button className="seek-btn" onClick={()=>seekBy(-25)} aria-label="Voltar 25 segundos"><RotateCcw/><b>25</b></button>}
+        {!isLive&&<button className="seek-btn" onClick={()=>seekBy(25)} aria-label="Avançar 25 segundos"><RotateCw/><b>25</b></button>}
+        <button onClick={()=>{setMuted(!muted);wake()}}>{muted?<VolumeX/>:<Volume2/>}</button>
+        {isLive&&<span className="live-tag"><span className="dot"/>AO VIVO</span>}
+        <div className="control-spacer"/>
+        <div className="fit-wrap">
+          <button onClick={()=>{setFitOpen(o=>!o);wake()}} aria-label="Proporção da imagem" title="Proporção da imagem"><Ratio/></button>
+          {fitOpen&&<div className="fit-menu">{FITS.map(([v,label])=>
+            <button key={v} className={fit===v?'is-on':''} onClick={()=>{setFit(v);setFitOpen(false);wake()}}>{label}</button>)}</div>}
+        </div>
+        <button className={favorite?'fav-active':''} onClick={()=>{toggleFav();wake()}}><Star fill={favorite?'currentColor':'none'}/></button>
+        <button onClick={fullscreen}>{full?<Minimize/>:<Maximize/>}</button>
+      </div>
+    </div>
+  </div></div>
+}
+
+function BottomNav({page,setPage}){return <nav className="bottom-nav"><button className={page==='home'?'active':''} onClick={()=>setPage('home')}><Home/><span>Início</span></button><button className={page==='live'?'active':''} onClick={()=>setPage('live')}><Tv/><span>TV</span></button><button className={page==='movies'?'active':''} onClick={()=>setPage('movies')}><Film/><span>Filmes</span></button><button className={page==='series'?'active':''} onClick={()=>setPage('series')}><Layers3/><span>Séries</span></button></nav>}
+createRoot(document.getElementById('root')).render(<App/>);

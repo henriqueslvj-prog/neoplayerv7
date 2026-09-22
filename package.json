@@ -1,7 +1,7 @@
 {
-  "name": "esteticpro",
+  "name": "neoplayer",
   "private": true,
-  "version": "1.2.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,10 +9,11 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.112.3",
+    "hls.js": "^1.5.17",
     "lucide-react": "^0.468.0",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "mpegts.js": "^1.8.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.4",
